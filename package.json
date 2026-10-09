@@ -1,0 +1,16 @@
+{
+  "name": "remove-bg",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "serve": "node scripts/serve.mjs",
+    "start": "npm run build && npm run serve"
+  },
+  "devDependencies": {
+    "@imgly/background-removal-data": "1.4.5",
+    "coi-serviceworker": "0.1.7",
+    "onnxruntime-web": "1.30.0"
+  }
+}
