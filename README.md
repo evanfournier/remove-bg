@@ -36,9 +36,12 @@ The first image downloads the 84 MB model; it is cached in the browser after tha
 ## Deploy on GitHub Pages
 
 1. Repository **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-2. Push to `main` (or run the **Deploy to GitHub Pages** workflow manually from the
-   Actions tab). The site is published at `https://<user>.github.io/remove-bg/`.
+2. Push to the branch listed in `.github/workflows/static.yml` (or run the
+   **Deploy static content to Pages** workflow from the Actions tab). It builds the
+   site and publishes `dist/` at `https://<user>.github.io/remove-bg/`.
 
+The site must be built before it is published: the repository itself has no
+`index.html` at its root, and the AI model is only added to `dist/` by the build.
 Any static host works: deploy the `dist/` folder produced by `npm run build`.
 
 ## Notes
