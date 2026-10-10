@@ -11,7 +11,7 @@ for (let n = 0; n < 256; n++) {
   CRC_TABLE[n] = c >>> 0;
 }
 
-function crc32(bytes) {
+export function crc32(bytes) {
   let crc = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) {
     crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);

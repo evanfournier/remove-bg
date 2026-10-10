@@ -36,8 +36,23 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install dependencies
-        run: npm ci
+        run: |
+          npm ci
+          pip install onnx numpy
+      - name: Test
+        run: npm test
+      # The BiRefNet conversion (224 MB download + ONNX rewrite) only reruns when
+      # the conversion script or the build script changes.
+      - name: Cache converted models
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: models-${{ hashFiles('scripts/convert_birefnet.py', 'scripts/build.mjs') }}
       - name: Build
         run: npm run build
       - name: Setup Pages

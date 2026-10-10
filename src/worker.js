@@ -2,101 +2,114 @@
 //
 // Quality guarantees:
 //  - the output has exactly the input's width and height;
-//  - every RGB value is the decoded original, only the alpha channel changes;
-//  - the output is a lossless PNG that keeps the original colour profile.
+//  - only the alpha channel is computed: the RGB of every fully opaque source
+//    pixel is the decoded original, bit for bit;
+//  - the output is a lossless PNG; the source's colour profile is kept when the
+//    browser can decode without colour conversion (Chrome, Edge, Firefox).
 // The AI model only sees a 1024x1024 copy of the image to compute the mask;
-// the mask is then scaled up and applied to the full-resolution pixels.
+// the mask is then cleaned, snapped to the photo's own edges at full
+// resolution (refine.js) and applied to the original pixels.
 
 import { extractColorChunks } from './color.js';
+import { applyMask, downscaleAlpha, prepareMask } from './mask.js';
 import { encodePng } from './png.js';
+import { refineAlpha } from './refine.js';
 
-const MODEL_URL = new URL('models/isnet.onnx', self.location.href).href;
-const MODEL_CACHE = 'remove-bg-model-v1';
-const SIZE = 1024; // model input resolution
-// The raw model output leaves solid subjects slightly see-through (alpha
-// 230-254) and leaves faint haze in the background. Map confident values to
-// fully opaque / fully transparent and keep only the real edges soft.
-const MASK_LOW = 0.2;
-const MASK_HIGH = 0.9;
+const MODEL_CACHE = 'remove-bg-models';
+const PREVIEW_MAX = 2048; // longest side of the on-screen preview
 
-const post = (msg) => self.postMessage(msg);
+const post = (msg, transfer) => self.postMessage(msg, transfer || []);
+const url = (path) => new URL(path, self.location.href).href;
 
 let ort = null;
-let session = null;
+let manifest = null;
+let engine = null; // { id, session, model }
 
-async function fetchModel() {
+async function getManifest() {
+  if (!manifest) {
+    const res = await fetch(url('models/manifest.json'), { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`Could not load the model list (HTTP ${res.status})`);
+    manifest = await res.json();
+  }
+  return manifest;
+}
+
+/** Downloads a model (or reads it from Cache Storage), reporting progress. */
+async function fetchModel(model, onProgress) {
+  const modelUrl = url(model.file);
   let cache = null;
   try {
     cache = await caches.open(MODEL_CACHE);
-    const hit = await cache.match(MODEL_URL);
+    const hit = await cache.match(modelUrl);
     if (hit) return new Uint8Array(await hit.arrayBuffer());
   } catch {
     // Cache Storage can be unavailable (private mode); just download.
   }
 
-  const res = await fetch(MODEL_URL);
-  if (!res.ok) throw new Error(`Could not download the model (HTTP ${res.status})`);
-  const total = Number(res.headers.get('content-length')) || 0;
+  const res = await fetch(modelUrl);
+  if (!res.ok) throw new Error(`Could not download the AI model (HTTP ${res.status})`);
+  const total = model.bytes;
+  const bytes = new Uint8Array(total);
   const reader = res.body.getReader();
-  const parts = [];
   let loaded = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    parts.push(value);
+    if (loaded + value.length > total) throw new Error('The AI model download is larger than expected');
+    bytes.set(value, loaded);
     loaded += value.length;
-    post({ type: 'model-progress', loaded, total });
+    onProgress(loaded, total);
   }
-  const model = new Uint8Array(loaded);
-  let o = 0;
-  for (const p of parts) { model.set(p, o); o += p.length; }
+  if (loaded !== total) throw new Error('The AI model download was interrupted; please retry');
 
   try {
-    await cache?.put(MODEL_URL, new Response(model));
+    await cache?.put(modelUrl, new Response(bytes));
+    // Model files are content-hashed: drop any that this site no longer uses.
+    const current = new Set((await getManifest()).models.map((m) => url(m.file)));
+    for (const request of await cache.keys()) {
+      if (!current.has(request.url)) await cache.delete(request);
+    }
   } catch {
     // Not fatal: the model will simply be downloaded again next time.
   }
-  return model;
+  return bytes;
 }
 
-// The model runs on the CPU (WebAssembly). ONNX Runtime's WebGPU backend cannot
-// run this model (MaxPool with ceil_mode is not implemented there).
-async function createSession() {
-  ort = await import(new URL('ort/ort.wasm.min.js', self.location.href).href);
-  ort.env.wasm.wasmPaths = {
-    mjs: new URL('ort/ort-wasm-simd-threaded.js', self.location.href).href,
-    wasm: new URL('ort/ort-wasm-simd-threaded.wasm', self.location.href).href,
-  };
-  // Multi-threading needs cross-origin isolation (see coi-serviceworker).
-  ort.env.wasm.numThreads = self.crossOriginIsolated
-    ? Math.min(8, navigator.hardwareConcurrency || 4)
-    : 1;
+async function getEngine(modelId, onProgress) {
+  const { models } = await getManifest();
+  const model = models.find((m) => m.id === modelId) || models.find((m) => m.default) || models[0];
+  if (engine?.id === model.id) return engine;
 
-  post({ type: 'engine', text: 'Downloading AI model (first time only)…' });
-  const model = await fetchModel();
-  post({ type: 'engine', text: 'Starting AI model…' });
-  const created = await ort.InferenceSession.create(model, {
+  if (!ort) {
+    ort = await import(url('ort/ort.wasm.min.js'));
+    ort.env.wasm.wasmPaths = {
+      mjs: url('ort/ort-wasm-simd-threaded.js'),
+      wasm: url('ort/ort-wasm-simd-threaded.wasm'),
+    };
+    // Multi-threading needs cross-origin isolation (see coi-serviceworker).
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1;
+  }
+  // Only one model in memory at a time: they share the 4 GB WebAssembly heap.
+  if (engine) {
+    await engine.session.release().catch(() => {});
+    engine = null;
+  }
+
+  const bytes = await fetchModel(model, (loaded, total) => {
+    post({ type: 'model-progress', label: model.label, loaded, total, done: false });
+    onProgress(loaded / total);
+  });
+  post({ type: 'model-progress', done: true });
+  // The model runs on the CPU (WebAssembly): ONNX Runtime's WebGPU backend lacks
+  // operators these models need (ceil-mode MaxPool, DeformConv).
+  const session = await ort.InferenceSession.create(bytes, {
     executionProviders: ['wasm'],
     graphOptimizationLevel: 'all',
   });
   const threads = ort.env.wasm.numThreads;
-  post({ type: 'engine', text: `Engine: CPU, ${threads} thread${threads > 1 ? 's' : ''}` });
-  return created;
-}
-
-/** Returns the 1024x1024 foreground mask (values 0..1). */
-async function predictMask(input) {
-  session ??= await createSession();
-  const tensor = new ort.Tensor('float32', input, [1, 3, SIZE, SIZE]);
-  const out = await session.run({ [session.inputNames[0]]: tensor });
-  const mask = out[session.outputNames[0]].data;
-
-  const levels = new Float32Array(mask.length);
-  for (let i = 0; i < mask.length; i++) {
-    const v = (mask[i] - MASK_LOW) / (MASK_HIGH - MASK_LOW);
-    levels[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-  }
-  return levels;
+  post({ type: 'engine', text: `CPU · ${threads} thread${threads > 1 ? 's' : ''}` });
+  engine = { id: model.id, session, model };
+  return engine;
 }
 
 function decodeOptions(keepColorSpace) {
@@ -114,16 +127,12 @@ function canvas2d(width, height) {
 /**
  * We want the raw pixel values (no colour conversion) whenever we can attach the
  * source's colour profile to the output. Check on a small copy that the browser
- * really honours colorSpaceConversion: 'none' and that it changes anything; if
- * not, decode normally (to sRGB) and write no profile.
+ * really honours colorSpaceConversion: 'none' (Safari ignores it) and that it
+ * changes anything; if not, decode normally (to sRGB) and write no profile.
  */
 async function shouldKeepColorSpace(file) {
   const read = async (keep) => {
-    const bitmap = await createImageBitmap(file, {
-      ...decodeOptions(keep),
-      resizeWidth: 64,
-      resizeHeight: 64,
-    });
+    const bitmap = await createImageBitmap(file, { ...decodeOptions(keep), resizeWidth: 64, resizeHeight: 64 });
     const ctx = canvas2d(64, 64);
     ctx.drawImage(bitmap, 0, 0, 64, 64);
     bitmap.close();
@@ -133,91 +142,129 @@ async function shouldKeepColorSpace(file) {
   return raw.some((v, i) => v !== converted[i]);
 }
 
-function modelInput(bitmap) {
-  const ctx = canvas2d(SIZE, SIZE);
+/**
+ * Copies the full-resolution pixels out of the bitmap in horizontal bands. A
+ * single huge canvas is not an option: Safari cannot allocate one above 16.7 MP
+ * (iOS 17) and then silently reads back transparent black.
+ */
+function readPixels(bitmap, width, height) {
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  const bandHeight = Math.max(1, Math.min(height, Math.floor((1 << 22) / width)));
+  const ctx = canvas2d(width, bandHeight);
+  ctx.fillRect(0, 0, 1, 1);
+  if (ctx.getImageData(0, 0, 1, 1).data[3] !== 255) {
+    throw new Error('This image is too large for this browser');
+  }
+  for (let y = 0; y < height; y += bandHeight) {
+    const h = Math.min(bandHeight, height - y);
+    ctx.clearRect(0, 0, width, bandHeight);
+    ctx.drawImage(bitmap, 0, y, width, h, 0, 0, width, h); // 1:1 copy, no resampling
+    pixels.set(ctx.getImageData(0, 0, width, h).data, y * width * 4);
+  }
+  return pixels;
+}
+
+/**
+ * The model's input: the image squeezed to size x size, normalised, planar RGB.
+ * The squeezed RGBA is returned too: it guides the edge refinement.
+ */
+function modelInput(bitmap, { size, mean, std }) {
+  const ctx = canvas2d(size, size);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(bitmap, 0, 0, SIZE, SIZE);
-  const rgba = ctx.getImageData(0, 0, SIZE, SIZE).data;
-  const plane = SIZE * SIZE;
+  ctx.drawImage(bitmap, 0, 0, size, size);
+  const rgba = ctx.getImageData(0, 0, size, size).data;
+  const plane = size * size;
   const input = new Float32Array(3 * plane);
-  for (let i = 0, j = 0; j < plane; i += 4, j++) {
-    input[j] = (rgba[i] - 128) / 256;
-    input[j + plane] = (rgba[i + 1] - 128) / 256;
-    input[j + 2 * plane] = (rgba[i + 2] - 128) / 256;
+  for (let c = 0; c < 3; c++) {
+    const scale = 1 / (255 * std[c]), offset = mean[c] / std[c];
+    for (let i = c, j = c * plane, end = j + plane; j < end; i += 4, j++) input[j] = rgba[i] * scale - offset;
   }
-  return input;
+  return { input, guide: rgba };
 }
 
-/** Scales the mask to full size (bilinear) and multiplies it into the alpha channel. */
-function applyMask(pixels, width, height, mask) {
-  const x0 = new Int32Array(width), x1 = new Int32Array(width), fx = new Float32Array(width);
-  for (let x = 0; x < width; x++) {
-    const p = Math.min(Math.max((x + 0.5) * (SIZE / width) - 0.5, 0), SIZE - 1);
-    x0[x] = Math.floor(p);
-    x1[x] = Math.min(x0[x] + 1, SIZE - 1);
-    fx[x] = p - x0[x];
-  }
-  for (let y = 0; y < height; y++) {
-    const q = Math.min(Math.max((y + 0.5) * (SIZE / height) - 0.5, 0), SIZE - 1);
-    const r0 = Math.floor(q) * SIZE;
-    const r1 = Math.min(Math.floor(q) + 1, SIZE - 1) * SIZE;
-    const fy = q - Math.floor(q);
-    for (let x = 0, o = y * width * 4 + 3; x < width; x++, o += 4) {
-      const top = mask[r0 + x0[x]] + (mask[r0 + x1[x]] - mask[r0 + x0[x]]) * fx[x];
-      const bottom = mask[r1 + x0[x]] + (mask[r1 + x1[x]] - mask[r1 + x0[x]]) * fx[x];
-      pixels[o] = pixels[o] * (top + (bottom - top) * fy); // keeps existing transparency
-    }
-  }
+/** A small RGBA preview of the result for the page (the PNG is full size). */
+async function makePreview(bitmap, pixels, width, height) {
+  const scale = Math.min(1, PREVIEW_MAX / Math.max(width, height));
+  const pw = Math.max(1, Math.round(width * scale)), ph = Math.max(1, Math.round(height * scale));
+  const ctx = canvas2d(pw, ph);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bitmap, 0, 0, pw, ph);
+  const image = ctx.getImageData(0, 0, pw, ph);
+  const alpha = downscaleAlpha(pixels, width, height, pw, ph);
+  for (let i = 0; i < alpha.length; i++) image.data[4 * i + 3] = alpha[i];
+  ctx.putImageData(image, 0, 0);
+  return ctx.canvas.convertToBlob({ type: 'image/webp', quality: 0.9 });
 }
 
-async function removeBackground(id, file) {
+async function removeBackground(id, file, modelId, sharpen) {
   const started = performance.now();
-  const status = (text) => post({ type: 'status', id, text });
+  const stage = (text, progress = null) => post({ type: 'stage', id, text, progress });
 
-  status('Reading image…');
+  stage('Reading image…', 0.02);
   const bytes = new Uint8Array(await file.arrayBuffer());
   const colorChunks = await extractColorChunks(bytes).catch(() => []);
-  const keepColorSpace =
-    colorChunks.length > 0 && (await shouldKeepColorSpace(file).catch(() => false));
+  const keepColorSpace = colorChunks.length > 0 && (await shouldKeepColorSpace(file).catch(() => false));
 
-  const bitmap = await createImageBitmap(file, decodeOptions(keepColorSpace));
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file, decodeOptions(keepColorSpace));
+  } catch {
+    throw new Error('this browser cannot open this file type (try JPEG, PNG or WebP)');
+  }
   const { width, height } = bitmap;
-  const pixels = (() => {
-    const ctx = canvas2d(width, height);
-    ctx.drawImage(bitmap, 0, 0);
-    return ctx.getImageData(0, 0, width, height).data;
-  })();
-  const input = modelInput(bitmap);
-  bitmap.close();
 
-  status('Detecting the subject…');
-  const mask = await predictMask(input);
+  try {
+    const { session, model } = await getEngine(modelId, (p) => stage('Downloading AI model (first time only)…', p));
+    const { input, guide } = modelInput(bitmap, model);
 
-  status('Building full-resolution cut-out…');
-  applyMask(pixels, width, height, mask);
+    stage('Detecting the subject…', null);
+    const tensor = new ort.Tensor('float32', input, [1, 3, model.size, model.size]);
+    const out = await session.run({ [session.inputNames[0]]: tensor }, [session.outputNames[0]]);
+    const mask = prepareMask(out[session.outputNames[0]].data, model);
+    out[session.outputNames[0]].dispose?.();
 
-  status('Saving lossless PNG…');
-  const blob = await encodePng(pixels, width, height, keepColorSpace ? colorChunks : []);
+    stage(sharpen ? 'Refining the edges…' : 'Building the full-resolution cut-out…', 0.75);
+    const pixels = readPixels(bitmap, width, height);
+    if (sharpen) refineAlpha(pixels, width, height, mask, model.size, guide);
+    else applyMask(pixels, width, height, mask, model.size);
+    const preview = await makePreview(bitmap, pixels, width, height);
 
-  post({
-    type: 'done',
-    id,
-    blob,
-    width,
-    height,
-    colorProfile: keepColorSpace,
-    seconds: (performance.now() - started) / 1000,
-  });
+    stage('Saving lossless PNG…', 0.9);
+    const blob = await encodePng(pixels, width, height, keepColorSpace ? colorChunks : []);
+    post({
+      type: 'done',
+      id,
+      blob,
+      preview,
+      width,
+      height,
+      colorProfile: keepColorSpace,
+      modelLabel: model.label,
+      sharpen,
+      seconds: (performance.now() - started) / 1000,
+    });
+  } finally {
+    bitmap.close();
+  }
 }
 
 // Process images one at a time: large photos need a lot of memory.
+const cancelled = new Set();
 let queue = Promise.resolve();
 self.onmessage = ({ data }) => {
-  queue = queue.then(() =>
-    removeBackground(data.id, data.file).catch((err) => {
+  if (data.type === 'cancel') {
+    for (const id of data.ids) cancelled.add(id);
+    return;
+  }
+  if (data.type !== 'process') return;
+  queue = queue.then(async () => {
+    if (cancelled.has(data.id)) return;
+    try {
+      await removeBackground(data.id, data.file, data.model, data.sharpen !== false);
+    } catch (err) {
       console.error(err);
       post({ type: 'error', id: data.id, message: err?.message || String(err) });
-    }),
-  );
+    }
+  });
 };

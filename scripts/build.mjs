@@ -1,14 +1,19 @@
 // Assembles the static website in dist/:
 //   - the app (src/)
-//   - ONNX Runtime Web (runs the AI model with WebAssembly)
-//   - the ISNet background-removal model
+//   - ONNX Runtime Web (runs the AI models with WebAssembly)
+//   - the AI models + models/manifest.json describing them
 //   - coi-serviceworker (enables multi-threading on GitHub Pages)
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { copyFile, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
 const dist = new URL('dist/', root);
 const modules = new URL('node_modules/', root);
+const cache = new URL('.cache/', root);
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 await rm(dist, { recursive: true, force: true });
 await cp(new URL('src/', root), dist, { recursive: true });
@@ -26,23 +31,113 @@ await copyFile(
   new URL('coi-serviceworker.min.js', dist),
 );
 
-// Model: ISNet (general use, fp16) as packaged by IMG.LY. The npm package ships
-// it in 4 MB chunks named by their SHA-256; verify and join them.
-const data = new URL('@imgly/background-removal-data/dist/', modules);
-const resources = JSON.parse(await readFile(new URL('resources.json', data), 'utf8'));
-const entry = resources['/models/medium'];
-const chunks = await Promise.all(
-  entry.chunks.map(async ({ hash }) => {
-    const bytes = await readFile(new URL(hash, data));
-    if (createHash('sha256').update(bytes).digest('hex') !== hash) {
-      throw new Error(`Model chunk ${hash} is corrupted`);
-    }
-    return bytes;
-  }),
-);
-const model = Buffer.concat(chunks);
-if (model.length !== entry.size) throw new Error('Model size mismatch');
-await mkdir(new URL('models/', dist));
-await writeFile(new URL('models/isnet.onnx', dist), model);
+// ---- Models -------------------------------------------------------------------
 
-console.log(`Built dist/ (model ${(model.length / 1024 / 1024).toFixed(1)} MB)`);
+/** ISNet (general use, fp16) as packaged by IMG.LY: 4 MB chunks named by SHA-256. */
+async function isnet() {
+  const data = new URL('@imgly/background-removal-data/dist/', modules);
+  const resources = JSON.parse(await readFile(new URL('resources.json', data), 'utf8'));
+  const entry = resources['/models/medium'];
+  const chunks = await Promise.all(
+    entry.chunks.map(async ({ hash }) => {
+      const bytes = await readFile(new URL(hash, data));
+      if (sha256(bytes) !== hash) throw new Error(`ISNet chunk ${hash} is corrupted`);
+      return bytes;
+    }),
+  );
+  const model = Buffer.concat(chunks);
+  if (model.length !== entry.size) throw new Error('ISNet size mismatch');
+  return model;
+}
+
+/**
+ * BiRefNet-lite (MIT), published as ONNX by the rembg project. It is converted by
+ * scripts/convert_birefnet.py so it fits in the browser's memory (see that file).
+ * Needs Python 3 with `pip install onnx numpy`; the result is cached in .cache/.
+ */
+const BIREFNET = {
+  url: 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx',
+  sha256: '5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333',
+};
+
+async function birefnet() {
+  const script = await readFile(new URL('scripts/convert_birefnet.py', root));
+  const key = sha256(BIREFNET.sha256 + sha256(script)).slice(0, 16);
+  const converted = new URL(`birefnet-${key}.onnx`, cache);
+  if (existsSync(converted)) return readFile(converted);
+
+  await mkdir(cache, { recursive: true });
+  const source = new URL('birefnet-source.onnx', cache);
+  if (!existsSync(source) || sha256(await readFile(source)) !== BIREFNET.sha256) {
+    console.log('Downloading BiRefNet-lite (224 MB)…');
+    const res = await fetch(BIREFNET.url);
+    if (!res.ok) throw new Error(`BiRefNet download failed: HTTP ${res.status}`);
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (sha256(bytes) !== BIREFNET.sha256) throw new Error('BiRefNet download has the wrong checksum');
+    await writeFile(source, bytes);
+  }
+
+  console.log('Converting BiRefNet-lite for the browser…');
+  const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const tmp = new URL(`birefnet-${key}.tmp`, cache);
+  const result = spawnSync(
+    python,
+    [fileURLToPath(new URL('scripts/convert_birefnet.py', root)), fileURLToPath(source), fileURLToPath(tmp)],
+    { stdio: 'inherit' },
+  );
+  if (result.status !== 0) {
+    throw new Error(`conversion failed (${result.error?.message || `exit ${result.status}`}); ` +
+      'install Python 3 and run: pip install onnx numpy');
+  }
+  await rename(tmp, converted);
+  return readFile(converted);
+}
+
+const MODELS = [
+  {
+    id: 'birefnet',
+    label: 'Best quality (BiRefNet)',
+    load: birefnet,
+    // ImageNet normalisation; the output is a logit.
+    mean: [0.485, 0.456, 0.406],
+    std: [0.229, 0.224, 0.225],
+    sigmoid: true,
+    // Confident model: only trim faint haze and near-opaque noise.
+    levels: [0.03, 0.97],
+  },
+  {
+    id: 'isnet',
+    label: 'Faster (ISNet)',
+    load: isnet,
+    // (x - 128) / 256 on 0..255 values, as in IMG.LY's pipeline; output in 0..1.
+    mean: [128 / 255, 128 / 255, 128 / 255],
+    std: [256 / 255, 256 / 255, 256 / 255],
+    sigmoid: false,
+    // Raw ISNet leaves solid subjects slightly see-through and faint haze around.
+    levels: [0.2, 0.9],
+  },
+];
+
+await mkdir(new URL('models/', dist));
+const manifest = { models: [] };
+for (const { load, ...model } of MODELS) {
+  let bytes;
+  try {
+    bytes = await load();
+  } catch (err) {
+    // Deploys must ship every model; local builds can go on without one.
+    if (process.env.CI) throw err;
+    console.warn(`Skipping model "${model.id}": ${err.message}`);
+    continue;
+  }
+  // Content-hashed name: browsers fetch and cache a new file whenever it changes.
+  const file = `models/${model.id}-${sha256(bytes).slice(0, 12)}.onnx`;
+  await writeFile(new URL(file, dist), bytes);
+  manifest.models.push({ ...model, file, bytes: bytes.length, size: 1024 });
+  console.log(`  ${file} (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`);
+}
+if (!manifest.models.length) throw new Error('No model could be built');
+manifest.models[0].default = true;
+await writeFile(new URL('models/manifest.json', dist), JSON.stringify(manifest, null, 2));
+
+console.log('Built dist/');

@@ -4,47 +4,219 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Remove Background</title>
-  <link rel="icon" href="data:,">
-  <!-- Enables multi-threaded CPU inference on hosts that can't set COOP/COEP headers (GitHub Pages). -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b5bd6'/%3E%3Cpath d='M9 22l5-7 4 5 3-4 4 6z' fill='white'/%3E%3C/svg%3E">
+  <!-- Enables multi-threaded inference on hosts that can't set COOP/COEP headers (GitHub Pages).
+       require-corp everywhere: Safari does not implement COEP "credentialless". -->
+  <script>window.coi = { coepCredentialless: () => false };</script>
   <script src="coi-serviceworker.min.js"></script>
   <style>
-    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { margin: 0 auto; padding: 16px; max-width: 1200px; }
-    h1 { font-size: 1.4rem; margin: 0 0 12px; }
+    :root {
+      --bg: #f5f6f8; --surface: #ffffff; --surface-2: #f0f1f4; --text: #15171c; --muted: #555b66;
+      --border: #dfe2e7; --accent: #5b5bd6; --accent-text: #ffffff; --accent-soft: #ececfd;
+      --ok: #1f7a4d; --error: #c4321c; --error-soft: #fdecea;
+      --checker-a: #e6e8ec; --checker-b: #ffffff;
+      --shadow: 0 1px 2px rgb(16 24 40 / 0.06), 0 4px 16px rgb(16 24 40 / 0.06);
+      --radius: 14px;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1115; --surface: #171a21; --surface-2: #1f232c; --text: #eceef2; --muted: #a4abb8;
+        --border: #2c313c; --accent: #8f8ff5; --accent-text: #0f1115; --accent-soft: #252642;
+        --ok: #5fd39a; --error: #ff8a76; --error-soft: #3a1f1b;
+        --checker-a: #2a2e37; --checker-b: #20232a;
+        --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 20px rgb(0 0 0 / 0.25);
+        color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 16px 64px; }
+    header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+    .logo { width: 40px; height: 40px; border-radius: 10px; background: var(--accent); display: grid; place-items: center; flex: none; }
+    header h1 { font-size: 1.5rem; line-height: 1.2; margin: 0; letter-spacing: -0.01em; }
+    header p { margin: 2px 0 0; color: var(--muted); font-size: 0.95rem; }
+    .engine { margin-left: auto; font-size: 0.85rem; color: var(--muted); background: var(--surface); border: 1px solid var(--border); padding: 4px 10px; border-radius: 999px; }
+    .engine:empty { display: none; }
+
     #drop {
-      display: block; border: 2px dashed #888; border-radius: 8px; padding: 32px 16px;
-      text-align: center; cursor: pointer;
+      display: block; background: var(--surface); border: 2px dashed var(--border); border-radius: var(--radius);
+      padding: 36px 20px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
     }
-    body.dragging #drop { border-color: #2a7fff; background: #2a7fff22; }
-    #toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
-    #engine { opacity: 0.75; font-size: 0.9rem; }
-    .item { border-top: 1px solid #8884; padding: 12px 0; }
-    .item header { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
-    .item .name { font-weight: 600; overflow-wrap: anywhere; }
-    .item .status { opacity: 0.75; font-size: 0.9rem; }
-    .item .status.error { color: #e53935; opacity: 1; }
-    .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .pair img { width: 100%; max-height: 420px; object-fit: contain; display: block; }
-    .result {
-      background: repeating-conic-gradient(#ccc 0% 25%, #fff 0% 50%) 50% / 20px 20px;
-      min-height: 80px;
+    #drop:hover, #drop:focus-within { border-color: var(--accent); }
+    body.dragging #drop { border-color: var(--accent); background: var(--accent-soft); }
+    #drop .title { font-size: 1.15rem; font-weight: 600; margin: 10px 0 4px; }
+    #drop .hint { color: var(--muted); font-size: 0.95rem; margin: 0; }
+    #drop .button { margin-top: 16px; }
+
+    .button, button {
+      font: inherit; font-size: 0.95rem; font-weight: 600; border-radius: 10px; padding: 9px 16px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--surface); color: var(--text); display: inline-flex; align-items: center; gap: 8px;
+      text-decoration: none; line-height: 1.2;
     }
-    @media (max-width: 600px) { .pair { grid-template-columns: 1fr; } }
+    .button.primary, button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+    .toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 16px 0;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px;
+    }
+    .toolbar .group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .toolbar label.caption { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+    .toolbar .spacer { flex: 1; }
+    .check { font-size: 0.95rem; cursor: pointer; }
+    .check input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
+    select { font: inherit; font-size: 0.95rem; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+    .swatches { display: flex; gap: 6px; }
+    .swatch { width: 30px; height: 30px; padding: 0; border-radius: 8px; border: 2px solid var(--border); }
+    .swatch[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .swatch.checker { background: repeating-conic-gradient(#c9ccd3 0% 25%, #ffffff 0% 50%) 50% / 12px 12px; }
+    .swatch.white { background: #fff; } .swatch.black { background: #000; }
+    .swatch.custom { position: relative; overflow: hidden; background: conic-gradient(red, yellow, lime, cyan, blue, magenta, red); }
+    .swatch.custom input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+
+    #model-progress { margin: -4px 0 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; }
+    #model-progress[hidden] { display: none; }
+    #model-progress .row { display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 8px; gap: 12px; }
+    progress { width: 100%; height: 8px; appearance: none; border: 0; border-radius: 99px; background: var(--surface-2); overflow: hidden; }
+    progress::-webkit-progress-bar { background: var(--surface-2); }
+    progress::-webkit-progress-value { background: var(--accent); border-radius: 99px; }
+    progress::-moz-progress-bar { background: var(--accent); border-radius: 99px; }
+
+    #list { display: grid; gap: 16px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .card .info { display: flex; align-items: center; gap: 12px; padding: 12px 16px; flex-wrap: wrap; }
+    .card .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+    .card .meta { color: var(--muted); font-size: 0.9rem; display: flex; gap: 6px 14px; flex-wrap: wrap; }
+    .card .actions { margin-left: auto; display: flex; gap: 8px; }
+    .card .error { margin: 0 16px 14px; padding: 10px 12px; border-radius: 10px; background: var(--error-soft); color: var(--error); font-size: 0.95rem; }
+
+    .stage { position: relative; background: var(--surface-2); display: grid; place-items: center; }
+    .compare {
+      position: relative; width: 100%; aspect-ratio: 3 / 2; margin: 0 auto; overflow: hidden; user-select: none;
+      --pos: 50%;
+    }
+    #list[data-bg="checker"] .result-bg { background: repeating-conic-gradient(var(--checker-a) 0% 25%, var(--checker-b) 0% 50%) 50% / 20px 20px; }
+    #list[data-bg="white"] .result-bg { background: #fff; }
+    #list[data-bg="black"] .result-bg { background: #000; }
+    #list[data-bg="custom"] .result-bg { background: var(--custom-bg, #3fa34d); }
+    .compare img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+    .compare .result-bg { position: absolute; inset: 0; }
+    .compare .before { clip-path: inset(0 calc(100% - var(--pos)) 0 0); }
+    .compare .divider { position: absolute; top: 0; bottom: 0; left: var(--pos); width: 2px; margin-left: -1px; background: #fff; box-shadow: 0 0 0 1px rgb(0 0 0 / .35); pointer-events: none; }
+    .compare .knob { position: absolute; top: 50%; left: var(--pos); width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 6px rgb(0 0 0 / .4); display: grid; place-items: center; pointer-events: none; color: #333; font-size: 14px; }
+    .compare input[type=range] { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: ew-resize; }
+    .compare .tag { position: absolute; top: 10px; font-size: 0.75rem; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; background: rgb(0 0 0 / .55); color: #fff; padding: 3px 8px; border-radius: 6px; pointer-events: none; }
+    .compare .tag.left { left: 10px; } .compare .tag.right { right: 10px; }
+    .compare[data-state="processing"] .after, .compare[data-state="processing"] .divider, .compare[data-state="processing"] .knob,
+    .compare[data-state="processing"] .tag, .compare[data-state="processing"] input,
+    .compare[data-state="error"] .after, .compare[data-state="error"] .divider, .compare[data-state="error"] .knob,
+    .compare[data-state="error"] .tag, .compare[data-state="error"] input { display: none; }
+    .compare[data-state="processing"] .before, .compare[data-state="error"] .before { clip-path: none; }
+
+    .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgb(15 17 21 / .55); color: #fff; text-align: center; padding: 16px; }
+    .overlay[hidden] { display: none; }
+    .overlay .box { display: grid; gap: 10px; justify-items: center; font-weight: 600; min-width: 220px; }
+    .overlay progress { width: 220px; background: rgb(255 255 255 / .25); }
+    .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid rgb(255 255 255 / .3); border-top-color: #fff; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(1turn); } }
+    @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+    .empty { text-align: center; color: var(--muted); padding: 28px 0 0; font-size: 0.95rem; }
+    footer { margin-top: 40px; color: var(--muted); font-size: 0.85rem; text-align: center; }
+    footer a { color: inherit; }
+    @media (max-width: 640px) {
+      header h1 { font-size: 1.3rem; }
+      .engine { margin-left: 0; }
+      .card .actions { margin-left: 0; width: 100%; }
+      .card .actions > * { flex: 1; justify-content: center; }
+    }
   </style>
 </head>
 <body>
-  <h1>Remove Background</h1>
-  <label id="drop">
-    <strong>Drop images here, click to choose, or paste (Ctrl/Cmd+V)</strong><br>
-    <small>Runs entirely in your browser. Output: lossless PNG, same resolution, original pixels and colour profile.</small>
-    <input id="file" type="file" accept="image/*" multiple hidden>
-  </label>
-  <div id="toolbar">
-    <button id="download-all" disabled>Download all</button>
-    <button id="clear">Clear</button>
-    <span id="engine"></span>
+  <div class="wrap">
+    <header>
+      <div class="logo" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l4.5-6 3.5 4.5 2.5-3L20 18H4z"/><circle cx="16" cy="7" r="2"/></svg>
+      </div>
+      <div>
+        <h1>Remove Background</h1>
+        <p>Private: images never leave your browser. Full resolution, lossless PNG.</p>
+      </div>
+      <span class="engine" id="engine"></span>
+    </header>
+
+    <label id="drop">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="color: var(--accent)"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+      <p class="title">Drop images here</p>
+      <p class="hint">JPEG, PNG, WebP… several at once. You can also paste with Ctrl/Cmd+V.</p>
+      <span class="button primary">Choose images</span>
+      <input id="file" type="file" accept="image/*" multiple hidden>
+    </label>
+
+    <div class="toolbar">
+      <div class="group">
+        <label class="caption" for="quality">Model</label>
+        <select id="quality"></select>
+      </div>
+      <label class="group check" title="Snaps the cut-out to the photo's real edges. Turn off for very soft hair or fur.">
+        <input type="checkbox" id="sharpen" checked> Sharpen edges
+      </label>
+      <div class="group" role="group" aria-label="Preview background">
+        <span class="caption">Preview on</span>
+        <div class="swatches">
+          <button class="swatch checker" data-bg="checker" title="Checkerboard" aria-label="Checkerboard" aria-pressed="true"></button>
+          <button class="swatch white" data-bg="white" title="White" aria-label="White" aria-pressed="false"></button>
+          <button class="swatch black" data-bg="black" title="Black" aria-label="Black" aria-pressed="false"></button>
+          <button class="swatch custom" data-bg="custom" title="Custom colour" aria-label="Custom colour" aria-pressed="false"><input type="color" id="custom-color" value="#3fa34d" aria-label="Pick a colour"></button>
+        </div>
+      </div>
+      <span class="spacer"></span>
+      <div class="group">
+        <button id="clear" disabled>Clear</button>
+        <button id="download-all" class="primary" disabled>Download all (.zip)</button>
+      </div>
+    </div>
+
+    <div id="model-progress" hidden>
+      <div class="row"><span id="model-progress-label">Downloading AI model (first time only)</span><span id="model-progress-mb"></span></div>
+      <progress id="model-progress-bar" max="1" value="0"></progress>
+    </div>
+
+    <main id="list" aria-live="polite"></main>
+    <p class="empty" id="empty">Your results will appear here. Drag the slider on each image to compare before and after.</p>
+
+    <footer>Runs on your device with <a href="https://onnxruntime.ai/">ONNX Runtime</a>. The model is downloaded once and then cached.</footer>
   </div>
-  <main id="list"></main>
+
+  <template id="card-template">
+    <article class="card">
+      <div class="stage">
+        <div class="compare" data-state="processing">
+          <div class="result-bg"></div>
+          <img class="after" alt="Result">
+          <img class="before" alt="Original">
+          <div class="divider"></div>
+          <div class="knob" aria-hidden="true">⇔</div>
+          <span class="tag left">Original</span>
+          <span class="tag right">Result</span>
+          <input type="range" min="0" max="100" value="50" step="0.1" aria-label="Compare original and result">
+        </div>
+        <div class="overlay"><div class="box"><div class="spinner"></div><span class="status">Waiting…</span><progress max="1" value="0"></progress></div></div>
+      </div>
+      <div class="info">
+        <span class="name"></span>
+        <span class="meta"></span>
+        <div class="actions"><a class="button primary download" hidden>Download PNG</a></div>
+      </div>
+    </article>
+  </template>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>

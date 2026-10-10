@@ -6,7 +6,8 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "serve": "node scripts/serve.mjs",
-    "start": "npm run build && npm run serve"
+    "start": "npm run build && npm run serve",
+    "test": "node --test \"tests/*.test.mjs\""
   },
   "devDependencies": {
     "@imgly/background-removal-data": "1.4.5",
