@@ -1,3 +1,4 @@
+import { isOutOfMemoryMessage } from './errors.js';
 import { makeZip } from './zip.js';
 
 const $ = (id) => document.getElementById(id);
@@ -83,8 +84,13 @@ function startWorker(model) {
   worker.onmessage = ({ data }) => onWorkerMessage(data);
   worker.onerror = (event) => {
     event.preventDefault();
-    // A crash (usually out of memory) kills the job: report it as such.
-    onWorkerMessage({ type: 'error', id: running, message: event.message || 'the processing stopped unexpectedly', outOfMemory: true });
+    // A crash kills the job. A failed script load has no message: not memory.
+    onWorkerMessage({
+      type: 'error',
+      id: running,
+      message: event.message || 'the processing stopped unexpectedly; please retry',
+      outOfMemory: isOutOfMemoryMessage(event.message),
+    });
   };
 }
 
@@ -99,6 +105,8 @@ async function pump() {
     running = null;
     return pump();
   }
+  // Added before the model list loaded: use the (now restored) selection.
+  if (!models.some((m) => m.id === item.model)) item.model = qualitySelect.value;
   if (worker && workerModel !== item.model) stopWorker();
   if (!worker) startWorker(item.model);
   setStatus(item, 'Starting…');

@@ -12,6 +12,7 @@
 // resolution (refine.js) and applied to the original pixels.
 
 import { extractColorChunks } from './color.js';
+import { isOutOfMemoryMessage } from './errors.js';
 import { applyMask, prepareMask, resizeRGBA } from './mask.js';
 import { encodePng } from './png.js';
 import { refineAlpha } from './refine.js';
@@ -37,6 +38,7 @@ async function fetchModel(model, models, onProgress) {
   let cache = null;
   try {
     cache = await caches.open(MODEL_CACHE);
+    await caches.delete('remove-bg-model-v1'); // first release's cache (exact name: shared github.io origin)
     const hit = await cache.match(modelUrl);
     if (hit) {
       const bytes = new Uint8Array(await hit.arrayBuffer());
@@ -174,11 +176,9 @@ function modelInput(rgba, { size, mean, std }) {
   return input;
 }
 
-/** Memory exhaustion shows up differently in each browser and in ONNX Runtime. */
+/** Out of memory while running the model (a lighter model may then fit). */
 const isOutOfMemory = (err) =>
-  /bad_alloc|out of memory|allocation failed|memory access out of bounds|Aborted|Maximum call stack/i.test(
-    String(err?.message || err),
-  ) || err instanceof RangeError;
+  !err?.imageStage && (err instanceof RangeError || isOutOfMemoryMessage(err?.message || err));
 
 async function removeBackground(id, file, modelId, sharpen) {
   const started = performance.now();
@@ -193,12 +193,16 @@ async function removeBackground(id, file, modelId, sharpen) {
   try {
     bitmap = await createImageBitmap(file, decodeOptions(keepColorSpace));
   } catch {
-    throw new Error('this browser cannot open this file type (try JPEG, PNG or WebP)');
+    throw Object.assign(new Error('this browser cannot open this file type (try JPEG, PNG or WebP)'), { imageStage: true });
   }
   const { width, height } = bitmap;
   let pixels;
   try {
     pixels = readPixels(bitmap, width, height);
+  } catch (err) {
+    // Memory spent on the image itself: a lighter model would not help.
+    const memory = err instanceof RangeError || isOutOfMemoryMessage(err?.message);
+    throw Object.assign(new Error(memory ? 'not enough memory to open this image' : err.message), { imageStage: true });
   } finally {
     bitmap.close();
   }
