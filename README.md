@@ -1,7 +1,8 @@
 # Remove Background
 
 A small website that removes the background from your photos. Everything runs
-in your browser: images are never uploaded anywhere.
+in your browser: images are never uploaded anywhere, unless you turn on the
+optional AI agent.
 
 Drop images on the page (or click to pick them, or paste with Ctrl/Cmd+V). Each
 result has a before/after slider and can be previewed on a checkerboard, white,
@@ -18,6 +19,39 @@ black or any colour to check the edges. Download one PNG or all of them as a ZIP
   photo's real edges at full resolution with an iterated colour guided filter, so
   large photos get crisp edges without a halo of background colour. It can be
   switched off ("Sharpen edges") for very soft hair or fur.
+
+## Keep what belongs to the subject (plates, hands…)
+
+Background-removal models keep the "salient object": on a food photo they keep
+the food and drop the plate; on a pizza shared between friends they drop the
+hands. Two ways to fix that:
+
+- **Edit selection** (on each result, free, offline): click an object to keep
+  it, or switch to *Remove* and click what should go. Drag a box instead of
+  clicking to select a whole object (a plate); a box drawn to remove takes
+  everything that lies inside it (several tomatoes at once). Objects are
+  selected with [Segment Anything](https://segment-anything.com/) (ViT-B), which
+  runs in the browser; the first use downloads it (117 MB) and analyses the
+  photo (a few seconds). *Apply* renders the full-resolution PNG again.
+- **AI agent** (optional, needs an [Anthropic API key](https://console.anthropic.com/settings/keys)):
+  Claude Opus 5.5 looks at the photo and at the cut-out the way a person would
+  and decides what the subject is: the plate the food is served on, the hands
+  holding the subject, the person holding a product... It then selects those
+  objects itself (boxes given to Segment Anything), looks at the updated
+  cut-out after each change and corrects itself. Turn it on with the
+  **✨ AI agent** button: it checks every new photo automatically, or only on
+  request ("Edit selection" → "Ask AI", where you can also tell it what you
+  want, e.g. "keep the hands").
+  - Privacy: a copy of the photo reduced to 1024 pixels, and the cut-out, are
+    sent to Anthropic's API. Your full-resolution image never leaves the browser.
+  - Cost: billed to your API account, typically a few cents per photo; the
+    estimate is shown under each photo.
+  - The key is stored in this browser's local storage (unless you untick
+    "Remember"), and is sent only to `api.anthropic.com`. Note that every page
+    of a `<user>.github.io` site shares that storage.
+  - Requests opt in to Anthropic's server-side fallback (`fallbacks: "default"`):
+    if Claude Opus 5.5 declines a request, the API retries it on the model
+    Anthropic recommends, in the same call.
 
 ## No quality loss
 
@@ -44,13 +78,15 @@ BiRefNet model (without them the build still works, with ISNet only).
 npm install
 python3 -m venv .venv && .venv/bin/pip install onnx numpy   # Windows: .venv\Scripts\pip
 npm start          # builds dist/ and serves it on http://localhost:8080
-npm test           # unit tests (PNG/ZIP encoders, mask refinement, colour profiles)
+npm test           # unit tests (encoders, masks, colour profiles, the AI agent against a mocked API)
 ```
 
 The build uses `.venv` automatically; set `PYTHON=/path/to/python` to use another.
 
 The first image downloads the chosen model (about 90 MB); it is cached in the
-browser after that.
+browser after that. The build also downloads Segment Anything (from the rembg
+releases, checked by SHA-256) and bundles the AI agent with the Anthropic SDK
+(esbuild).
 
 ## How the BiRefNet model is prepared
 
@@ -90,6 +126,8 @@ Any static host works: deploy the `dist/` folder produced by `npm run build`.
 ## Credits and licences
 
 - BiRefNet (MIT), ONNX export from rembg (MIT).
+- Segment Anything ViT-B by Meta (Apache-2.0), quantised ONNX export from rembg.
+- [Anthropic TypeScript SDK](https://github.com/anthropics/anthropic-sdk-typescript) (MIT).
 - ISNet weights as packaged by IMG.LY in
   [`@imgly/background-removal-data`](https://www.npmjs.com/package/@imgly/background-removal-data) (AGPL-3.0).
 - [ONNX Runtime Web](https://onnxruntime.ai/) (MIT).

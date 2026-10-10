@@ -1,5 +1,5 @@
 // Assembles the static website in dist/:
-//   - the app (src/)
+//   - the app (src/), with the AI agent bundled with the Anthropic SDK
 //   - ONNX Runtime Web (runs the AI models with WebAssembly)
 //   - the AI models + models/manifest.json describing them
 //   - coi-serviceworker (enables multi-threading on GitHub Pages)
@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { copyFile, cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 
 const root = new URL('../', import.meta.url);
 const dist = new URL('dist/', root);
@@ -17,6 +18,20 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 await rm(dist, { recursive: true, force: true });
 await cp(new URL('src/', root), dist, { recursive: true });
+
+// The AI agent imports the Anthropic SDK: bundle it into one browser module.
+await build({
+  entryPoints: [fileURLToPath(new URL('src/agent.js', root))],
+  outfile: fileURLToPath(new URL('agent.js', dist)),
+  allowOverwrite: true,
+  bundle: true,
+  format: 'esm',
+  platform: 'browser',
+  target: 'es2022',
+  minify: true,
+  legalComments: 'linked',
+  logLevel: 'warning',
+});
 
 // ONNX Runtime: the JS API plus its WebAssembly build. Files are renamed
 // .mjs -> .js so any static host serves them with a JavaScript MIME type.
@@ -106,6 +121,38 @@ async function birefnet() {
   return readFile(converted);
 }
 
+/** A file published by the rembg project, downloaded once into .cache/ and checked by SHA-256. */
+async function download(name, { url, sha256: expected }) {
+  await mkdir(cache, { recursive: true });
+  const path = new URL(name, cache);
+  if (existsSync(path)) {
+    const bytes = await readFile(path);
+    if (sha256(bytes) === expected) return bytes;
+  }
+  console.log(`Downloading ${name}…`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${name} download failed: HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  if (sha256(bytes) !== expected) throw new Error(`${name} download has the wrong checksum`);
+  await writeFile(path, bytes);
+  return bytes;
+}
+
+/**
+ * Segment Anything (ViT-B, quantised; Apache-2.0), as exported to ONNX for rembg:
+ * selects whole objects from a click or a box ("Edit selection", AI agent).
+ */
+const SAM = {
+  encoder: {
+    url: 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/sam_vit_b_01ec64.encoder.quant.onnx',
+    sha256: '181301ce3500a86c38450b56e2b71dab8008a13b1812a0d6cc812f22651e143a',
+  },
+  decoder: {
+    url: 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/sam_vit_b_01ec64.decoder.quant.onnx',
+    sha256: 'b11465135b7c93a1fd65141a4e2a96f1ddf2e3dab09b5eeab640bdf5f10aadbe',
+  },
+};
+
 const MODELS = [
   {
     id: 'birefnet',
@@ -156,6 +203,21 @@ for (const { load, ...model } of MODELS) {
 }
 if (!manifest.models.length) throw new Error('No model could be built');
 manifest.models[0].default = true;
+
+try {
+  manifest.sam = { label: 'Segment Anything (ViT-B)' };
+  for (const part of ['encoder', 'decoder']) {
+    const bytes = await download(`sam-${part}.onnx`, SAM[part]);
+    const file = `models/sam-${part}-${sha256(bytes).slice(0, 12)}.onnx`;
+    await writeFile(new URL(file, dist), bytes);
+    manifest.sam[part] = { file, bytes: bytes.length };
+    console.log(`  ${file} (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`);
+  }
+} catch (err) {
+  if (process.env.CI) throw err;
+  console.warn(`Skipping the selection model: ${err.message}`);
+  delete manifest.sam;
+}
 await writeFile(new URL('models/manifest.json', dist), JSON.stringify(manifest, null, 2));
 
 console.log('Built dist/');

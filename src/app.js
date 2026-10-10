@@ -1,4 +1,7 @@
+import { composeMask } from './compose.js';
+import { agentSession, closeEditor, editingItem, openEditor } from './editor.js';
 import { isOutOfMemoryMessage } from './errors.js';
+import { openImage, resetSelection } from './segmenter.js';
 import { makeZip } from './zip.js';
 
 const $ = (id) => document.getElementById(id);
@@ -62,10 +65,65 @@ customColor.addEventListener('input', () => setBackground('custom'));
 customColor.value = store.get('bg-color', customColor.value);
 setBackground(store.get('bg', 'checker'));
 
+// ---- AI agent settings --------------------------------------------------------
+// Claude checks the cut-outs and fixes them (agent.js), with the user's own API
+// key. Off until a key is entered; the key is only kept in this browser.
+
+const ai = {
+  key: store.get('ai-key', ''),
+  auto: store.get('ai-auto', '1') === '1',
+};
+const aiButton = $('ai-button');
+const aiDialog = $('ai-dialog');
+
+function updateAiButton() {
+  aiButton.textContent = !ai.key ? '✨ AI agent: off' : ai.auto ? '✨ AI agent: on' : '✨ AI agent: on request';
+  aiButton.classList.toggle('on', Boolean(ai.key));
+}
+
+function openAiSettings() {
+  $('ai-key').value = ai.key;
+  $('ai-remember').checked = !ai.key || store.get('ai-key', '') === ai.key;
+  $('ai-auto').checked = ai.auto;
+  aiDialog.showModal();
+}
+
+aiButton.addEventListener('click', openAiSettings);
+$('ai-form').addEventListener('submit', (event) => {
+  if (event.submitter?.value !== 'save') return;
+  ai.key = $('ai-key').value.trim();
+  ai.auto = $('ai-auto').checked;
+  store.set('ai-key', ai.key && $('ai-remember').checked ? ai.key : '');
+  store.set('ai-auto', ai.auto ? '1' : '0');
+  updateAiButton();
+  // Check the photos that are already done.
+  if (ai.key && ai.auto) for (const item of items.values()) if (item.baseMask && !item.aiChecked) scheduleAgent(item);
+});
+$('ai-close').addEventListener('click', () => aiDialog.close());
+$('ai-forget').addEventListener('click', () => {
+  ai.key = '';
+  store.set('ai-key', '');
+  updateAiButton();
+  aiDialog.close();
+});
+updateAiButton();
+
+let agentModule = null; // agent.js (with the Anthropic SDK), loaded on first use
+async function askAI(session, instruction, onStatus, signal) {
+  if (!ai.key) {
+    openAiSettings();
+    throw new Error('Add your Anthropic API key in the AI agent settings first.');
+  }
+  agentModule ??= await import('./agent.js');
+  return agentModule.runAgent({ apiKey: ai.key, session, instruction, onStatus, signal });
+}
+const describeError = (err) => (agentModule ? agentModule.describeError(err) : err?.message || String(err));
+
 // ---- Worker and job queue -----------------------------------------------------
 // Jobs run one at a time. The worker is restarted when the model changes (each
 // model then gets a fresh 4 GB WebAssembly heap), when a job is cancelled, and
-// after a crash.
+// after a crash. A job is either a full run of the model, or the rendering of
+// an edited mask (objects added or removed), which does not need the model.
 
 let worker = null;
 let workerModel = null;
@@ -107,10 +165,18 @@ async function pump() {
   }
   // Added before the model list loaded: use the (now restored) selection.
   if (!models.some((m) => m.id === item.model)) item.model = qualitySelect.value;
-  if (worker && workerModel !== item.model) stopWorker();
+  // Rendering an edited mask works in any worker: keep the loaded model.
+  if (worker && workerModel !== item.model && !item.renderMask) stopWorker();
   if (!worker) startWorker(item.model);
   setStatus(item, 'Starting…');
-  worker.postMessage({ type: 'process', id: item.id, file: item.file, model: item.model, sharpen: item.sharpen });
+  worker.postMessage({
+    type: 'process',
+    id: item.id,
+    file: item.file,
+    model: item.model,
+    sharpen: item.sharpen,
+    mask: item.renderMask,
+  });
 }
 
 function finishJob() {
@@ -118,10 +184,25 @@ function finishJob() {
   pump();
 }
 
+/** Runs the model on the image (again), with the current settings. */
 function enqueue(item) {
+  if (editingItem() === item) closeEditor();
+  item.agentAbort?.abort();
   item.model = qualitySelect.value || store.get('model', '');
   item.sharpen = sharpenBox.checked;
   item.fallback = null;
+  item.renderMask = null;
+  showProcessing(item);
+  queue.push(item.id);
+  pump();
+}
+
+/** Renders the image with the model's mask plus the edits. */
+function enqueueRender(item, edits) {
+  item.edits = edits;
+  item.model = item.baseModel;
+  item.sharpen = sharpenBox.checked;
+  item.renderMask = composeMask(item.baseMask, edits);
   showProcessing(item);
   queue.push(item.id);
   pump();
@@ -147,13 +228,23 @@ function onWorkerMessage(data) {
     setStatus(item, data.text);
     setProgress(item.card.querySelector('.overlay progress'), data.progress);
   } else if (data.type === 'done') {
+    const fresh = Boolean(data.mask); // the model ran (not an edit)
+    if (fresh) {
+      item.baseMask = data.mask;
+      item.baseModel = item.model;
+      item.edits = [];
+      item.aiChecked = false;
+      setNote(item, '');
+    }
+    item.renderMask = null;
     showDone(item, data);
     finishJob();
+    if (fresh && ai.key && ai.auto) scheduleAgent(item);
   } else if (data.type === 'error') {
     modelPanel.hidden = true;
     stopWorker(); // its memory may be exhausted or corrupt
     const fallback = models.find((m) => m.id === item.model)?.fallback;
-    if (data.outOfMemory && fallback && !item.fallback) {
+    if (data.outOfMemory && fallback && !item.fallback && !item.renderMask) {
       // Not enough memory for this model on this device: use the lighter one.
       item.fallback = item.model;
       item.model = fallback;
@@ -161,8 +252,54 @@ function onWorkerMessage(data) {
       finishJob();
       return;
     }
+    item.renderMask = null;
     showError(item, data.message);
     finishJob();
+  }
+}
+
+// ---- AI agent on every new photo ---------------------------------------------
+// One photo at a time; the background removal of the next photos goes on
+// meanwhile. The agent's changes are rendered like the user's edits.
+
+const agentQueue = [];
+let agentRunning = false;
+
+function scheduleAgent(item) {
+  if (agentQueue.includes(item.id) || (item.agentAbort && !item.agentAbort.signal.aborted)) return;
+  agentQueue.push(item.id);
+  setNote(item, '✨ AI agent: waiting…');
+  runAgents();
+}
+
+async function runAgents() {
+  if (agentRunning || !agentQueue.length) return;
+  const item = items.get(agentQueue.shift());
+  if (!item || !item.baseMask || item.processing || editingItem() === item) {
+    if (item) setNote(item, '');
+    return runAgents();
+  }
+  agentRunning = true;
+  const controller = new AbortController();
+  item.agentAbort = controller;
+  updateCardActions(item);
+  const status = (text) => setNote(item, `✨ AI agent: ${text}`);
+  const edits = item.edits.slice();
+  try {
+    const view = await openImage(item.id, item.file, status);
+    const result = await askAI(agentSession(item, view, edits), '', status, controller.signal);
+    if (controller.signal.aborted || items.get(item.id) !== item) return;
+    item.aiChecked = true;
+    setNote(item, `✨ ${result.summary}`, result.cost);
+    if (result.changes) enqueueRender(item, edits);
+  } catch (err) {
+    if (items.get(item.id) === item && !controller.signal.aborted) setNote(item, `✨ AI agent: ${describeError(err)}`, null, true);
+    else if (items.get(item.id) === item) setNote(item, '');
+  } finally {
+    item.agentAbort = null;
+    agentRunning = false;
+    if (items.get(item.id) === item) updateCardActions(item);
+    runAgents();
   }
 }
 
@@ -186,11 +323,27 @@ function setStatus(item, text) {
   if (status.textContent !== text) status.textContent = text;
 }
 
+/** The line under the result that tells what the AI agent did. */
+function setNote(item, text, cost = null, error = false) {
+  const note = item.card.querySelector('.note');
+  note.hidden = !text;
+  note.classList.toggle('bad', error);
+  note.textContent = text + (cost ? ` (≈ $${cost.toFixed(2)})` : '');
+}
+
 function setAspect(card, width, height) {
   if (!width || !height) return;
   const compare = card.querySelector('.compare');
   compare.style.aspectRatio = `${width} / ${height}`;
   compare.style.width = `min(100%, calc(70vh * ${width / height}))`;
+}
+
+/** Edit is offered once the model's mask is there, and not while the agent works on it. */
+function updateCardActions(item) {
+  const edit = item.card.querySelector('.edit');
+  edit.hidden = item.processing || !item.baseMask;
+  edit.disabled = Boolean(item.agentAbort);
+  edit.title = item.agentAbort ? 'The AI agent is working on this photo' : 'Keep or remove objects: a plate, hands…';
 }
 
 function showProcessing(item) {
@@ -202,9 +355,9 @@ function showProcessing(item) {
   setProgress(card.querySelector('.overlay progress'), 0);
   card.querySelector('.error')?.remove();
   card.querySelector('.download').hidden = true;
-  const rerun = card.querySelector('.rerun');
-  if (document.activeElement === rerun) card.focus(); // keep keyboard focus in the card
-  rerun.hidden = true;
+  const actions = [...card.querySelectorAll('.rerun, .edit')];
+  if (actions.includes(document.activeElement)) card.focus(); // keep keyboard focus in the card
+  for (const b of actions) b.hidden = true;
   updateToolbar();
 }
 
@@ -223,6 +376,9 @@ function showDone(item, data) {
 
   const meta = [`${data.width} × ${data.height} px`, `PNG ${mb(data.blob.size)} MB`, `${data.seconds.toFixed(1)} s`, data.modelLabel];
   if (item.fallback) meta.push('lighter model used: not enough memory for the best one');
+  const kept = item.edits.filter((e) => e.mode === 'keep').length, removed = item.edits.length - kept;
+  if (kept) meta.push(`${kept} object${kept > 1 ? 's' : ''} kept`);
+  if (removed) meta.push(`${removed} object${removed > 1 ? 's' : ''} removed`);
   if (!data.sharpen) meta.push('edges not sharpened');
   if (data.colorProfile) meta.push('colour profile kept');
   card.querySelector('.meta').replaceChildren(
@@ -234,6 +390,7 @@ function showDone(item, data) {
   link.download = `${item.name.replace(/\.[^.]+$/, '')}-no-bg.png`;
   link.hidden = false;
   showRerun(item, 'Re-run');
+  updateCardActions(item);
   updateToolbar();
 }
 
@@ -254,6 +411,7 @@ function showError(item, message) {
   error.textContent = `Could not process this image: ${message}`;
   card.append(error);
   showRerun(item, 'Retry');
+  updateCardActions(item);
   updateToolbar();
 }
 
@@ -264,6 +422,13 @@ function showRerun(item, label) {
   if (document.activeElement === item.card) rerun.focus();
 }
 
+const editorHooks = {
+  apply: enqueueRender,
+  askAI,
+  describeError,
+  closed: (item) => item.card.querySelector('.edit').focus({ preventScroll: true }),
+};
+
 function addFiles(files) {
   for (const file of files) {
     if (file.type && !file.type.startsWith('image/')) continue;
@@ -271,7 +436,7 @@ function addFiles(files) {
     const card = template.content.firstElementChild.cloneNode(true);
     const name = file.name || `pasted-image-${id + 1}.png`;
     card.querySelector('.name').textContent = name;
-    const item = { id, card, file, name, originalUrl: URL.createObjectURL(file) };
+    const item = { id, card, file, name, originalUrl: URL.createObjectURL(file), edits: [] };
 
     const before = card.querySelector('.before');
     before.addEventListener('load', () => {
@@ -286,6 +451,7 @@ function addFiles(files) {
       slider.setAttribute('aria-valuetext', `${slider.value}% original`);
     });
     card.querySelector('.rerun').addEventListener('click', () => enqueue(item));
+    card.querySelector('.edit').addEventListener('click', () => openEditor(item, editorHooks));
 
     list.append(card);
     items.set(id, item);
@@ -349,15 +515,19 @@ downloadAllButton.addEventListener('click', async () => {
 });
 
 clearButton.addEventListener('click', () => {
+  closeEditor();
   queue.length = 0;
   if (running !== null) {
     stopWorker(); // abort the job in progress
     running = null;
     modelPanel.hidden = true;
   }
+  agentQueue.length = 0;
   for (const item of items.values()) {
+    item.agentAbort?.abort();
     for (const url of [item.originalUrl, item.resultUrl, item.previewUrl]) if (url) URL.revokeObjectURL(url);
   }
+  resetSelection();
   items.clear();
   list.replaceChildren();
   updateToolbar();
