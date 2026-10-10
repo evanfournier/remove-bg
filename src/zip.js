@@ -15,9 +15,11 @@ export async function makeZip(files) {
   const central = [];
   let offset = 0;
   for (const { name, blob } of files) {
-    const data = new Uint8Array(await blob.arrayBuffer());
+    // Read each file once for its CRC, then reference the Blob itself so the
+    // archive does not hold a second copy of every image in memory.
+    const crc = crc32(new Uint8Array(await blob.arrayBuffer()));
+    const size = blob.size;
     const nameBytes = encoder.encode(name);
-    const crc = crc32(data);
 
     const local = new DataView(new ArrayBuffer(30));
     local.setUint32(0, 0x04034b50, true); // local file header signature
@@ -27,10 +29,10 @@ export async function makeZip(files) {
     local.setUint16(10, dosTime, true);
     local.setUint16(12, dosDate, true);
     local.setUint32(14, crc, true);
-    local.setUint32(18, data.length, true);
-    local.setUint32(22, data.length, true);
+    local.setUint32(18, size, true);
+    local.setUint32(22, size, true);
     local.setUint16(26, nameBytes.length, true);
-    parts.push(local.buffer, nameBytes, data);
+    parts.push(local.buffer, nameBytes, blob);
 
     const entry = new DataView(new ArrayBuffer(46));
     entry.setUint32(0, 0x02014b50, true); // central directory signature
@@ -41,13 +43,13 @@ export async function makeZip(files) {
     entry.setUint16(12, dosTime, true);
     entry.setUint16(14, dosDate, true);
     entry.setUint32(16, crc, true);
-    entry.setUint32(20, data.length, true);
-    entry.setUint32(24, data.length, true);
+    entry.setUint32(20, size, true);
+    entry.setUint32(24, size, true);
     entry.setUint16(28, nameBytes.length, true);
     entry.setUint32(42, offset, true); // local header offset
     central.push(entry.buffer, nameBytes);
 
-    offset += 30 + nameBytes.length + data.length;
+    offset += 30 + nameBytes.length + size;
     if (offset > 0xffffffff) throw new Error('Too much data for one ZIP (4 GB); download images separately');
   }
 

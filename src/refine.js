@@ -10,7 +10,7 @@
 const OPTIONS = {
   lo: 0.2, hi: 0.6, // hysteresis: keep pixels >= lo connected to a pixel >= hi
   minFrac: 0.005, keepPeak: 0.95, // drop blobs < 0.5% of the largest unless confident
-  holeFrac: 0.001, holeMean: 0.25, // fill enclosed holes that are tiny or half-believed
+  holeArea: 9, holeMean: 0.25, // fill enclosed holes of a few grid px (noise) or half-believed ones
   faint: 0.02, // mask values below this count as background when tracing regions
   r: 3, // guided filter window radius (grid px)
   eps: 1e-4, // guided filter regularisation (guide in 0..1)
@@ -115,11 +115,9 @@ function cleanMask(m, w, h, o) {
   for (let c = 1; c < fg.areas.length; c++) largest = Math.max(largest, fg.areas[c]);
   const peak = new Float32Array(fg.areas.length);
   for (let i = 0; i < n; i++) { const l = fg.label[i]; if (l && m[i] > peak[l]) peak[l] = m[i]; }
-  let fgArea = 0;
   for (let i = 0; i < n; i++) {
     const l = fg.label[i];
     S[i] = l && (fg.areas[l] >= o.minFrac * largest || peak[l] >= o.keepPeak) ? 1 : 0;
-    fgArea += S[i];
   }
 
   // Background components not touching the border are holes (4-connected, the
@@ -132,7 +130,7 @@ function cleanMask(m, w, h, o) {
   const p = new Float32Array(m);
   for (let i = 0; i < n; i++) {
     const l = bg.label[i];
-    if (l && !border[l] && (bg.areas[l] <= o.holeFrac * fgArea || sum[l] / bg.areas[l] >= o.holeMean)) p[i] = 1;
+    if (l && !border[l] && (bg.areas[l] <= o.holeArea || sum[l] / bg.areas[l] >= o.holeMean)) p[i] = 1;
   }
   // Zero the faint regions that are not attached to what we kept (stray blobs,
   // haze); soft tails attached to the subject (hair, fur) are left alone.

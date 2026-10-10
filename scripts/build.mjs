@@ -104,6 +104,10 @@ const MODELS = [
     sigmoid: true,
     // Confident model: only trim faint haze and near-opaque noise.
     levels: [0.03, 0.97],
+    // Its edges are already well placed: 2 sharpening passes keep fur natural.
+    refine: { iters: 2 },
+    // Needs ~2.8 GB of WebAssembly memory; phones may not have it.
+    fallback: 'isnet',
   },
   {
     id: 'isnet',
@@ -115,6 +119,7 @@ const MODELS = [
     sigmoid: false,
     // Raw ISNet leaves solid subjects slightly see-through and faint haze around.
     levels: [0.2, 0.9],
+    refine: { iters: 3 },
   },
 ];
 

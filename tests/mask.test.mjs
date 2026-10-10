@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { applyMask, downscaleAlpha, prepareMask } from '../src/mask.js';
+import { applyMask, prepareMask, resizeRGBA } from '../src/mask.js';
 import { refineAlpha } from '../src/refine.js';
 
 const S = 1024;
@@ -74,8 +74,26 @@ test('refineAlpha removes a faint stray blob but keeps the subject', () => {
   assert.equal(at(Math.round((905 * width) / S), Math.round((955 * height) / S)), 0);
 });
 
-test('downscaleAlpha averages blocks', () => {
-  const px = new Uint8ClampedArray(4 * 4 * 4);
-  for (let i = 0; i < 16; i++) px[i * 4 + 3] = i % 4 < 2 ? 255 : 0;
-  assert.deepEqual([...downscaleAlpha(px, 4, 4, 2, 2)], [255, 0, 255, 0]);
+test('resizeRGBA averages areas when shrinking and interpolates when enlarging', () => {
+  // 4x2 image: left half (200,100,0) opaque, right half transparent.
+  const px = new Uint8ClampedArray(4 * 2 * 4);
+  for (let i = 0; i < 8; i++) if (i % 4 < 2) px.set([200, 100, 0, 255], i * 4);
+  // Model input: composite on black, opaque.
+  assert.deepEqual([...resizeRGBA(px, 4, 2, 2, 1)], [200, 100, 0, 255, 0, 0, 0, 255]);
+  assert.deepEqual([...resizeRGBA(px, 4, 2, 1, 1)], [100, 50, 0, 255]);
+  // Preview: alpha averaged, colour un-premultiplied (no darkening at edges).
+  assert.deepEqual([...resizeRGBA(px, 4, 2, 1, 1, true)], [200, 100, 0, 128]);
+  // Enlarging a 2x1 gradient is linear between pixel centres.
+  const g = Uint8ClampedArray.of(0, 0, 0, 255, 200, 200, 200, 255);
+  const up = resizeRGBA(g, 2, 1, 4, 1);
+  assert.deepEqual([up[0], up[4], up[8], up[12]], [0, 50, 150, 200]);
+});
+
+test('resizeRGBA handles non-integer shrink factors exactly', () => {
+  const w = 5, px = new Uint8ClampedArray(w * 4);
+  for (let x = 0; x < w; x++) px.set([x * 50, 0, 0, 255], x * 4);
+  // 5 -> 2: [0, 50, half of 100] and [half of 100, 150, 200], each 2.5 px wide.
+  const out = resizeRGBA(px, w, 1, 2, 1);
+  assert.equal(out[0], Math.round((0 + 50 + 0.5 * 100) / 2.5));
+  assert.equal(out[4], Math.round((0.5 * 100 + 150 + 200) / 2.5));
 });

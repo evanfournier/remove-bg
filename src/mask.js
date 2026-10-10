@@ -46,21 +46,73 @@ export function applyMask(pixels, width, height, mask, size) {
 }
 
 /**
- * Box-averages the full-resolution alpha of `pixels` down to pw x ph (for the
- * on-screen preview). Returns a Uint8ClampedArray of pw * ph alpha values.
+ * 1-D resampling weights from `src` samples to `dst`: exact area averaging when
+ * shrinking, linear interpolation when enlarging. Returns per-output lists.
  */
-export function downscaleAlpha(pixels, width, height, pw, ph) {
-  const sum = new Float64Array(pw * ph), count = new Uint32Array(pw * ph);
-  const col = new Int32Array(width);
-  for (let x = 0; x < width; x++) col[x] = Math.min(pw - 1, Math.floor((x * pw) / width));
-  for (let y = 0; y < height; y++) {
-    const row = Math.min(ph - 1, Math.floor((y * ph) / height)) * pw;
-    for (let x = 0, o = y * width * 4 + 3; x < width; x++, o += 4) {
-      sum[row + col[x]] += pixels[o];
-      count[row + col[x]]++;
+function weights(dst, src) {
+  const start = new Int32Array(dst), count = new Int32Array(dst), w = [];
+  const scale = src / dst;
+  for (let i = 0; i < dst; i++) {
+    const taps = [];
+    if (scale >= 1) {
+      const a = i * scale, b = a + scale;
+      for (let s = Math.floor(a); s < Math.min(src, Math.ceil(b)); s++) {
+        taps.push(Math.min(b, s + 1) - Math.max(a, s));
+      }
+      start[i] = Math.floor(a);
+    } else {
+      const p = Math.min(Math.max((i + 0.5) * scale - 0.5, 0), src - 1);
+      const s0 = Math.floor(p), f = p - s0;
+      start[i] = s0;
+      taps.push(1 - f);
+      if (s0 + 1 < src) taps.push(f);
+    }
+    const total = taps.reduce((x, y) => x + y, 0);
+    count[i] = taps.length;
+    w.push(Float32Array.from(taps, (t) => t / total));
+  }
+  return { start, count, w };
+}
+
+/**
+ * Resizes RGBA pixels to outW x outH, averaging every covered source pixel
+ * (linear interpolation when enlarging). Done in JS rather than with a canvas:
+ * browsers differ in how well they downscale (Firefox ignores
+ * imageSmoothingQuality), and this works for images larger than a canvas may be.
+ * keepAlpha = false: composite on black, opaque output (model input).
+ * keepAlpha = true: average alpha, colours un-premultiplied (preview).
+ */
+export function resizeRGBA(pixels, width, height, outW, outH, keepAlpha = false) {
+  const xs = weights(outW, width), ys = weights(outH, height);
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  const row = new Float32Array(width * 4); // vertically combined, premultiplied
+  for (let y = 0; y < outH; y++) {
+    row.fill(0);
+    for (let k = 0; k < ys.count[y]; k++) {
+      const wy = ys.w[y][k];
+      for (let x = 0, o = (ys.start[y] + k) * width * 4, r = 0; x < width; x++, o += 4, r += 4) {
+        const a = pixels[o + 3] * wy;
+        row[r] += pixels[o] * a;
+        row[r + 1] += pixels[o + 1] * a;
+        row[r + 2] += pixels[o + 2] * a;
+        row[r + 3] += a;
+      }
+    }
+    for (let x = 0, o = y * outW * 4; x < outW; x++, o += 4) {
+      let r = 0, g = 0, b = 0, a = 0;
+      for (let k = 0, s = xs.start[x] * 4; k < xs.count[x]; k++, s += 4) {
+        const wx = xs.w[x][k];
+        r += row[s] * wx;
+        g += row[s + 1] * wx;
+        b += row[s + 2] * wx;
+        a += row[s + 3] * wx;
+      }
+      const scale = keepAlpha ? (a > 0 ? 1 / a : 0) : 1 / 255;
+      out[o] = r * scale;
+      out[o + 1] = g * scale;
+      out[o + 2] = b * scale;
+      out[o + 3] = keepAlpha ? a : 255;
     }
   }
-  const out = new Uint8ClampedArray(pw * ph);
-  for (let i = 0; i < out.length; i++) out[i] = sum[i] / count[i];
   return out;
 }

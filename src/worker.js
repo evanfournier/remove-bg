@@ -1,4 +1,5 @@
-// Runs the whole background-removal pipeline off the main thread.
+// Runs the background-removal pipeline off the main thread, one image at a time
+// (the page queues the jobs and restarts this worker to switch model or cancel).
 //
 // Quality guarantees:
 //  - the output has exactly the input's width and height;
@@ -11,43 +12,43 @@
 // resolution (refine.js) and applied to the original pixels.
 
 import { extractColorChunks } from './color.js';
-import { applyMask, downscaleAlpha, prepareMask } from './mask.js';
+import { applyMask, prepareMask, resizeRGBA } from './mask.js';
 import { encodePng } from './png.js';
 import { refineAlpha } from './refine.js';
 
 const MODEL_CACHE = 'remove-bg-models';
 const PREVIEW_MAX = 2048; // longest side of the on-screen preview
 
-const post = (msg, transfer) => self.postMessage(msg, transfer || []);
+const post = (msg) => self.postMessage(msg);
 const url = (path) => new URL(path, self.location.href).href;
 
 let ort = null;
-let manifest = null;
 let engine = null; // { id, session, model }
 
 async function getManifest() {
-  if (!manifest) {
-    const res = await fetch(url('models/manifest.json'), { cache: 'no-cache' });
-    if (!res.ok) throw new Error(`Could not load the model list (HTTP ${res.status})`);
-    manifest = await res.json();
-  }
-  return manifest;
+  const res = await fetch(url('models/manifest.json'), { cache: 'no-cache' });
+  if (!res.ok) throw new Error(`could not load the model list (HTTP ${res.status})`);
+  return res.json();
 }
 
 /** Downloads a model (or reads it from Cache Storage), reporting progress. */
-async function fetchModel(model, onProgress) {
+async function fetchModel(model, models, onProgress) {
   const modelUrl = url(model.file);
   let cache = null;
   try {
     cache = await caches.open(MODEL_CACHE);
     const hit = await cache.match(modelUrl);
-    if (hit) return new Uint8Array(await hit.arrayBuffer());
+    if (hit) {
+      const bytes = new Uint8Array(await hit.arrayBuffer());
+      if (bytes.length === model.bytes) return bytes;
+      await cache.delete(modelUrl); // damaged entry
+    }
   } catch {
     // Cache Storage can be unavailable (private mode); just download.
   }
 
   const res = await fetch(modelUrl);
-  if (!res.ok) throw new Error(`Could not download the AI model (HTTP ${res.status})`);
+  if (!res.ok) throw new Error(`could not download the AI model (HTTP ${res.status})`);
   const total = model.bytes;
   const bytes = new Uint8Array(total);
   const reader = res.body.getReader();
@@ -55,17 +56,17 @@ async function fetchModel(model, onProgress) {
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (loaded + value.length > total) throw new Error('The AI model download is larger than expected');
+    if (loaded + value.length > total) throw new Error('the AI model download is larger than expected');
     bytes.set(value, loaded);
     loaded += value.length;
     onProgress(loaded, total);
   }
-  if (loaded !== total) throw new Error('The AI model download was interrupted; please retry');
+  if (loaded !== total) throw new Error('the AI model download was interrupted; please retry');
 
   try {
     await cache?.put(modelUrl, new Response(bytes));
     // Model files are content-hashed: drop any that this site no longer uses.
-    const current = new Set((await getManifest()).models.map((m) => url(m.file)));
+    const current = new Set(models.map((m) => url(m.file)));
     for (const request of await cache.keys()) {
       if (!current.has(request.url)) await cache.delete(request);
     }
@@ -79,27 +80,25 @@ async function getEngine(modelId, onProgress) {
   const { models } = await getManifest();
   const model = models.find((m) => m.id === modelId) || models.find((m) => m.default) || models[0];
   if (engine?.id === model.id) return engine;
+  if (engine) throw new Error('internal error: one worker per model'); // the page restarts us
 
-  if (!ort) {
-    ort = await import(url('ort/ort.wasm.min.js'));
-    ort.env.wasm.wasmPaths = {
-      mjs: url('ort/ort-wasm-simd-threaded.js'),
-      wasm: url('ort/ort-wasm-simd-threaded.wasm'),
-    };
-    // Multi-threading needs cross-origin isolation (see coi-serviceworker).
-    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1;
-  }
-  // Only one model in memory at a time: they share the 4 GB WebAssembly heap.
-  if (engine) {
-    await engine.session.release().catch(() => {});
-    engine = null;
-  }
+  ort = await import(url('ort/ort.wasm.min.js'));
+  ort.env.wasm.wasmPaths = {
+    mjs: url('ort/ort-wasm-simd-threaded.js'),
+    wasm: url('ort/ort-wasm-simd-threaded.wasm'),
+  };
+  // Multi-threading needs cross-origin isolation (see coi-serviceworker).
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1;
 
-  const bytes = await fetchModel(model, (loaded, total) => {
-    post({ type: 'model-progress', label: model.label, loaded, total, done: false });
-    onProgress(loaded / total);
-  });
-  post({ type: 'model-progress', done: true });
+  let bytes;
+  try {
+    bytes = await fetchModel(model, models, (loaded, total) => {
+      post({ type: 'model-progress', label: model.label, loaded, total, done: false });
+      onProgress(loaded / total);
+    });
+  } finally {
+    post({ type: 'model-progress', done: true });
+  }
   // The model runs on the CPU (WebAssembly): ONNX Runtime's WebGPU backend lacks
   // operators these models need (ceil-mode MaxPool, DeformConv).
   const session = await ort.InferenceSession.create(bytes, {
@@ -153,7 +152,7 @@ function readPixels(bitmap, width, height) {
   const ctx = canvas2d(width, bandHeight);
   ctx.fillRect(0, 0, 1, 1);
   if (ctx.getImageData(0, 0, 1, 1).data[3] !== 255) {
-    throw new Error('This image is too large for this browser');
+    throw new Error('this image is too large for this browser');
   }
   for (let y = 0; y < height; y += bandHeight) {
     const h = Math.min(bandHeight, height - y);
@@ -164,38 +163,22 @@ function readPixels(bitmap, width, height) {
   return pixels;
 }
 
-/**
- * The model's input: the image squeezed to size x size, normalised, planar RGB.
- * The squeezed RGBA is returned too: it guides the edge refinement.
- */
-function modelInput(bitmap, { size, mean, std }) {
-  const ctx = canvas2d(size, size);
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(bitmap, 0, 0, size, size);
-  const rgba = ctx.getImageData(0, 0, size, size).data;
+/** Normalised planar RGB from the size x size RGBA copy of the image. */
+function modelInput(rgba, { size, mean, std }) {
   const plane = size * size;
   const input = new Float32Array(3 * plane);
   for (let c = 0; c < 3; c++) {
     const scale = 1 / (255 * std[c]), offset = mean[c] / std[c];
     for (let i = c, j = c * plane, end = j + plane; j < end; i += 4, j++) input[j] = rgba[i] * scale - offset;
   }
-  return { input, guide: rgba };
+  return input;
 }
 
-/** A small RGBA preview of the result for the page (the PNG is full size). */
-async function makePreview(bitmap, pixels, width, height) {
-  const scale = Math.min(1, PREVIEW_MAX / Math.max(width, height));
-  const pw = Math.max(1, Math.round(width * scale)), ph = Math.max(1, Math.round(height * scale));
-  const ctx = canvas2d(pw, ph);
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(bitmap, 0, 0, pw, ph);
-  const image = ctx.getImageData(0, 0, pw, ph);
-  const alpha = downscaleAlpha(pixels, width, height, pw, ph);
-  for (let i = 0; i < alpha.length; i++) image.data[4 * i + 3] = alpha[i];
-  ctx.putImageData(image, 0, 0);
-  return ctx.canvas.convertToBlob({ type: 'image/webp', quality: 0.9 });
-}
+/** Memory exhaustion shows up differently in each browser and in ONNX Runtime. */
+const isOutOfMemory = (err) =>
+  /bad_alloc|out of memory|allocation failed|memory access out of bounds|Aborted|Maximum call stack/i.test(
+    String(err?.message || err),
+  ) || err instanceof RangeError;
 
 async function removeBackground(id, file, modelId, sharpen) {
   const started = performance.now();
@@ -213,58 +196,59 @@ async function removeBackground(id, file, modelId, sharpen) {
     throw new Error('this browser cannot open this file type (try JPEG, PNG or WebP)');
   }
   const { width, height } = bitmap;
-
+  let pixels;
   try {
-    const { session, model } = await getEngine(modelId, (p) => stage('Downloading AI model (first time only)…', p));
-    const { input, guide } = modelInput(bitmap, model);
-
-    stage('Detecting the subject…', null);
-    const tensor = new ort.Tensor('float32', input, [1, 3, model.size, model.size]);
-    const out = await session.run({ [session.inputNames[0]]: tensor }, [session.outputNames[0]]);
-    const mask = prepareMask(out[session.outputNames[0]].data, model);
-    out[session.outputNames[0]].dispose?.();
-
-    stage(sharpen ? 'Refining the edges…' : 'Building the full-resolution cut-out…', 0.75);
-    const pixels = readPixels(bitmap, width, height);
-    if (sharpen) refineAlpha(pixels, width, height, mask, model.size, guide);
-    else applyMask(pixels, width, height, mask, model.size);
-    const preview = await makePreview(bitmap, pixels, width, height);
-
-    stage('Saving lossless PNG…', 0.9);
-    const blob = await encodePng(pixels, width, height, keepColorSpace ? colorChunks : []);
-    post({
-      type: 'done',
-      id,
-      blob,
-      preview,
-      width,
-      height,
-      colorProfile: keepColorSpace,
-      modelLabel: model.label,
-      sharpen,
-      seconds: (performance.now() - started) / 1000,
-    });
+    pixels = readPixels(bitmap, width, height);
   } finally {
     bitmap.close();
   }
+
+  const { session, model } = await getEngine(modelId, (p) => stage('Downloading AI model (first time only)…', p));
+  // The same squeezed copy feeds the model and guides the edge refinement.
+  const guide = resizeRGBA(pixels, width, height, model.size, model.size);
+
+  stage('Detecting the subject…', null);
+  const tensor = new ort.Tensor('float32', modelInput(guide, model), [1, 3, model.size, model.size]);
+  const out = await session.run({ [session.inputNames[0]]: tensor }, [session.outputNames[0]]);
+  const mask = prepareMask(out[session.outputNames[0]].data, model);
+  out[session.outputNames[0]].dispose?.();
+
+  stage(sharpen ? 'Refining the edges…' : 'Building the full-resolution cut-out…', 0.75);
+  if (sharpen) refineAlpha(pixels, width, height, mask, model.size, guide, model.refine);
+  else applyMask(pixels, width, height, mask, model.size);
+
+  stage('Saving lossless PNG…', 0.85);
+  const chunks = keepColorSpace ? colorChunks : [];
+  const blob = await encodePng(pixels, width, height, chunks);
+  // Preview: same pixels and colour profile as the PNG, so it looks identical.
+  const scale = Math.min(1, PREVIEW_MAX / Math.max(width, height));
+  const pw = Math.max(1, Math.round(width * scale)), ph = Math.max(1, Math.round(height * scale));
+  const preview = await encodePng(resizeRGBA(pixels, width, height, pw, ph, true), pw, ph, chunks);
+
+  post({
+    type: 'done',
+    id,
+    blob,
+    preview,
+    width,
+    height,
+    colorProfile: keepColorSpace,
+    modelLabel: model.label,
+    sharpen,
+    seconds: (performance.now() - started) / 1000,
+  });
 }
 
-// Process images one at a time: large photos need a lot of memory.
-const cancelled = new Set();
-let queue = Promise.resolve();
-self.onmessage = ({ data }) => {
-  if (data.type === 'cancel') {
-    for (const id of data.ids) cancelled.add(id);
-    return;
+let busy = false;
+self.onmessage = async ({ data }) => {
+  if (data.type !== 'process' || busy) return;
+  busy = true;
+  try {
+    await removeBackground(data.id, data.file, data.model, data.sharpen !== false);
+  } catch (err) {
+    console.error(err);
+    post({ type: 'error', id: data.id, message: err?.message || String(err), outOfMemory: isOutOfMemory(err) });
+  } finally {
+    busy = false;
   }
-  if (data.type !== 'process') return;
-  queue = queue.then(async () => {
-    if (cancelled.has(data.id)) return;
-    try {
-      await removeBackground(data.id, data.file, data.model, data.sharpen !== false);
-    } catch (err) {
-      console.error(err);
-      post({ type: 'error', id: data.id, message: err?.message || String(err) });
-    }
-  });
 };
