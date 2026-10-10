@@ -53,6 +53,9 @@ jobs:
         with:
           path: .cache
           key: models-${{ hashFiles('scripts/convert_birefnet.py', 'scripts/build.mjs') }}
+          # build.mjs checks the source checksum and names converted files by
+          # their inputs, so an older cache is safe to start from.
+          restore-keys: models-
       - name: Build
         run: npm run build
       - name: Setup Pages

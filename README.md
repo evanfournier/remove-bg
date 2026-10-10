@@ -37,14 +37,17 @@ edges) can change by one level after the browser decodes them; they look the sam
 
 ## Run it locally
 
-Requires Node.js 18+, and Python 3 with `pip install onnx numpy` for the BiRefNet
-model (without it the build still works, with ISNet only).
+Requires Node.js 18+, and Python 3 with `onnx` and `numpy` to prepare the
+BiRefNet model (without them the build still works, with ISNet only).
 
 ```sh
 npm install
+python3 -m venv .venv && .venv/bin/pip install onnx numpy   # Windows: .venv\Scripts\pip
 npm start          # builds dist/ and serves it on http://localhost:8080
 npm test           # unit tests (PNG/ZIP encoders, mask refinement, colour profiles)
 ```
+
+The build uses `.venv` automatically; set `PYTHON=/path/to/python` to use another.
 
 The first image downloads the chosen model (about 90 MB); it is cached in the
 browser after that.

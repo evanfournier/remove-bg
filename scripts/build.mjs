@@ -6,7 +6,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { copyFile, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
@@ -53,20 +53,34 @@ async function isnet() {
 /**
  * BiRefNet-lite (MIT), published as ONNX by the rembg project. It is converted by
  * scripts/convert_birefnet.py so it fits in the browser's memory (see that file).
- * Needs Python 3 with `pip install onnx numpy`; the result is cached in .cache/.
+ * Needs Python 3 with onnx and numpy (a .venv in the repo is used automatically);
+ * the result is cached in .cache/.
  */
 const BIREFNET = {
   url: 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx',
   sha256: '5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333',
 };
 
+/** Python to run the conversion: $PYTHON, else a local .venv, else the system one. */
+function python() {
+  if (process.env.PYTHON) return process.env.PYTHON;
+  const venv = new URL(process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python', root);
+  if (existsSync(venv)) return fileURLToPath(venv);
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
 async function birefnet() {
   const script = await readFile(new URL('scripts/convert_birefnet.py', root));
   const key = sha256(BIREFNET.sha256 + sha256(script)).slice(0, 16);
   const converted = new URL(`birefnet-${key}.onnx`, cache);
+  await mkdir(cache, { recursive: true });
+  for (const name of await readdir(cache)) {
+    if (/^birefnet-[0-9a-f]{16}\.(onnx|tmp)$/.test(name) && !name.startsWith(`birefnet-${key}.onnx`)) {
+      await rm(new URL(name, cache)); // conversions from older script versions
+    }
+  }
   if (existsSync(converted)) return readFile(converted);
 
-  await mkdir(cache, { recursive: true });
   const source = new URL('birefnet-source.onnx', cache);
   if (!existsSync(source) || sha256(await readFile(source)) !== BIREFNET.sha256) {
     console.log('Downloading BiRefNet-lite (224 MB)…');
@@ -78,16 +92,15 @@ async function birefnet() {
   }
 
   console.log('Converting BiRefNet-lite for the browser…');
-  const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   const tmp = new URL(`birefnet-${key}.tmp`, cache);
   const result = spawnSync(
-    python,
+    python(),
     [fileURLToPath(new URL('scripts/convert_birefnet.py', root)), fileURLToPath(source), fileURLToPath(tmp)],
     { stdio: 'inherit' },
   );
   if (result.status !== 0) {
     throw new Error(`conversion failed (${result.error?.message || `exit ${result.status}`}); ` +
-      'install Python 3 and run: pip install onnx numpy');
+      'set up Python with: python3 -m venv .venv && .venv/bin/pip install onnx numpy');
   }
   await rename(tmp, converted);
   return readFile(converted);
